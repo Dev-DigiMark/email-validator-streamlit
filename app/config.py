@@ -31,7 +31,7 @@ _CONFIG = {
     "smtp": {
         "connectTimeoutMs": 5000,
         "responseTimeoutMs": 8000,
-        "greylistRetryDelayMs": 180000,
+        "greylistRetryDelayMs": int(os.environ.get("GREYLIST_RETRY_DELAY_MS", "15000")),
         "maxRetries": 3,
         "ports": [
             {"port": 25, "mode": "plain"},

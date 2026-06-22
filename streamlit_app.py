@@ -18,6 +18,7 @@ import asyncio
 import io
 import re
 import threading
+import time
 import uuid
 
 import pandas as pd
@@ -202,8 +203,11 @@ def render_results(job_id: str) -> None:
     )
 
 
-# ── Progress fragment (polls the in-process store every 1s) ────────────────
-@st.fragment(run_every=1)
+# ── Progress fragment ──────────────────────────────────────────────────────
+# Polls the in-process store ONLY while the job is running. Once the job is
+# complete/failed it renders the final state and returns without scheduling
+# another rerun — so no status calls happen when nothing is running.
+@st.fragment
 def progress_view(job_id: str) -> None:
     job = job_store.get(job_id)
     if job is None:
@@ -249,6 +253,12 @@ def progress_view(job_id: str) -> None:
 
     if is_complete:
         render_results(job_id)
+        return  # done → stop polling (no further reruns scheduled)
+
+    # Still running → poll again in 1s. scope="fragment" reruns only this
+    # fragment, not the whole app, and stops automatically once complete.
+    time.sleep(1)
+    st.rerun(scope="fragment")
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
