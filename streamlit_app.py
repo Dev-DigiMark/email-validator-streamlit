@@ -1,26 +1,34 @@
-"""Streamlit front end for the FastAPI email-validation backend.
+"""Streamlit-only email-validation app (single process, no backend).
 
-Repo-root entrypoint for Streamlit Cloud. Talks to FastAPI over HTTP and polls
-GET /jobs/{id} for live progress (no websockets).
+Repo-root entrypoint for Streamlit Cloud. The 4-stage pipeline runs IN-PROCESS:
+streamlit_app.py imports app.pipeline.runner and calls run_pipeline directly in
+a background thread, writing progress/results into the in-memory job_store. The
+UI fragment polls that store every second. There is NO FastAPI server and NO
+BACKEND_URL — SMTP probes egress straight from this process on port 25.
 
 Run locally:
-    uvicorn app.main:app --port 8000      # backend
-    streamlit run streamlit_app.py        # this UI
+    streamlit run streamlit_app.py
 
-Set BACKEND_URL to point at a non-local backend.
+Deploy: Streamlit Community Cloud, main file = streamlit_app.py. SMTP mailbox
+verification requires outbound port 25 from wherever this process runs.
 """
 from __future__ import annotations
 
+import asyncio
 import io
-import os
+import re
+import threading
+import uuid
 
-import httpx
 import pandas as pd
 import streamlit as st
 
-BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
+from app.checks.dns import check_domain
+from app.checks.smtp import check_mailbox
+from app.pipeline.runner import run_pipeline
+from app.store.jobs import job_store
 
-# Mirror config/index.ts -> stages (frontend feature parity).
+# ── Stages / labels / columns (frontend feature parity) ────────────────────
 STAGES = [
     ("stage1", "Pre-flight checks", "Syntax, duplicates, lists"),
     ("stage2", "DNS verification", "MX records, SPF/DMARC, blacklists"),
@@ -36,7 +44,6 @@ STATUS_LABELS = {
     "duplicate": "Duplicate",
 }
 
-# Column order matching the backend export.
 DISPLAY_COLUMNS = [
     "email", "status", "sub_status", "score", "confidence", "flags",
     "did_you_mean", "mx_record", "smtp_provider", "smtp_response",
@@ -44,44 +51,40 @@ DISPLAY_COLUMNS = [
     "promoted_from_reserved", "demoted_from_reserved", "score_breakdown",
 ]
 
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
 st.set_page_config(page_title="EmailVerify", page_icon="✉️", layout="wide")
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────
-def _client() -> httpx.Client:
-    return httpx.Client(base_url=BACKEND_URL, timeout=30.0)
+# ── In-process job launch ──────────────────────────────────────────────────
+def _run_in_thread(emails: list[str], job_id: str) -> None:
+    """Run the async pipeline in its own event loop on a daemon thread so the
+    Streamlit script/fragment never blocks. The job_store singleton is shared
+    module state, so the UI thread sees progress as it's written."""
+    asyncio.run(run_pipeline(emails, job_id))
 
 
-def submit_emails(emails: list[str]) -> dict:
-    with _client() as c:
-        r = c.post("/validate", json={"emails": emails})
-    if r.status_code != 202:
-        raise RuntimeError(_err_text(r))
-    return r.json()
+def start_job(emails: list[str], filename: str) -> str:
+    job_id = uuid.uuid4().hex
+    job_store.create(job_id, filename, len(emails))
+    threading.Thread(
+        target=_run_in_thread, args=(emails, job_id), daemon=True
+    ).start()
+    return job_id
 
 
-def submit_file(name: str, data: bytes) -> dict:
-    with _client() as c:
-        r = c.post("/validate", files={"file": (name, data, "application/octet-stream")})
-    if r.status_code != 202:
-        raise RuntimeError(_err_text(r))
-    return r.json()
-
-
-def get_job(job_id: str) -> dict | None:
-    with _client() as c:
-        r = c.get(f"/jobs/{job_id}")
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    return r.json()
-
-
-def get_results(job_id: str) -> dict:
-    with _client() as c:
-        r = c.get(f"/results/{job_id}")
-    r.raise_for_status()
-    return r.json()
+def extract_emails(name: str, data: bytes) -> list[str]:
+    """Pull every email-like cell out of a CSV/XLSX (header-agnostic)."""
+    name = name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
+    else:
+        df = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
+    emails: list[str] = []
+    for val in df.values.ravel():
+        if isinstance(val, str):
+            emails.extend(EMAIL_RE.findall(val))
+    return emails
 
 
 def df_to_xlsx(df: pd.DataFrame) -> bytes:
@@ -91,24 +94,26 @@ def df_to_xlsx(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def _err_text(r: httpx.Response) -> str:
-    try:
-        body = r.json()
-        return body.get("error") or body.get("detail") or r.text
-    except Exception:
-        return r.text or f"HTTP {r.status_code}"
+# ── SMTP port-25 self-test ─────────────────────────────────────────────────
+def smtp_selftest(email: str) -> dict:
+    async def _run() -> dict:
+        domain = email.split("@", 1)[1]
+        dns = await check_domain(domain)
+        if not dns.mx_record:
+            return {"ok": False, "detail": f"No MX record for {domain}"}
+        res = await check_mailbox(email, dns.mx_record)
+        return {
+            "ok": bool(res.smtp_accessible),
+            "mx": dns.mx_record,
+            "code": res.smtp_response_code,
+            "sub_status": res.sub_status,
+            "response": res.smtp_response,
+        }
+
+    return asyncio.run(_run())
 
 
-def backend_ok() -> bool:
-    try:
-        with _client() as c:
-            c.get("/jobs/__healthcheck__")
-        return True
-    except Exception:
-        return False
-
-
-# ── Result rendering ──────────────────────────────────────────────────────
+# ── Result rendering ───────────────────────────────────────────────────────
 def _to_dataframe(results: list[dict]) -> pd.DataFrame:
     rows = []
     for r in results:
@@ -141,14 +146,15 @@ def _to_dataframe(results: list[dict]) -> pd.DataFrame:
     return df[cols] if cols else df
 
 
-def render_results(job_id: str, counts: dict) -> None:
-    payload = get_results(job_id)
-    results = payload.get("results", [])
-    counts = payload.get("counts", counts) or counts
+def render_results(job_id: str) -> None:
+    job = job_store.get(job_id)
+    if not job:
+        return
+    results = [r.model_dump() for r in job["results"]]
+    counts = job["counts"]
 
     st.subheader(f"Results · {len(results)} emails")
 
-    # Bucket summary (mirrors BucketGrid).
     cols = st.columns(len(STATUS_LABELS))
     for col, (key, label) in zip(cols, STATUS_LABELS.items()):
         col.metric(label, counts.get(key, 0))
@@ -160,7 +166,6 @@ def render_results(job_id: str, counts: dict) -> None:
 
     df = _to_dataframe(results)
 
-    # Sub-status filter (mirrors SubStatusFilter).
     fcol1, fcol2 = st.columns(2)
     status_opts = ["(all)"] + sorted(df["status"].dropna().unique().tolist()) if "status" in df else ["(all)"]
     sub_opts = ["(all)"] + sorted(df["sub_status"].dropna().unique().tolist()) if "sub_status" in df else ["(all)"]
@@ -175,8 +180,6 @@ def render_results(job_id: str, counts: dict) -> None:
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-    # Download buttons — built client-side from the full results df (same
-    # columns/flattening as the backend export).
     dcol1, dcol2 = st.columns(2)
     dcol1.download_button(
         "⬇ Download CSV", data=df.to_csv(index=False).encode("utf-8"),
@@ -190,10 +193,10 @@ def render_results(job_id: str, counts: dict) -> None:
     )
 
 
-# ── Progress fragment (polls every 1s) ────────────────────────────────────
+# ── Progress fragment (polls the in-process store every 1s) ────────────────
 @st.fragment(run_every=1)
 def progress_view(job_id: str) -> None:
-    job = get_job(job_id)
+    job = job_store.get(job_id)
     if job is None:
         st.error("Job not found.")
         return
@@ -203,7 +206,7 @@ def progress_view(job_id: str) -> None:
     progress = job.get("progress") or {}
 
     if status == "failed":
-        st.error("Validation failed. Check the backend logs.")
+        st.error(f"Validation failed: {job.get('error') or 'unknown error'}")
         return
 
     is_complete = status == "complete"
@@ -216,7 +219,6 @@ def progress_view(job_id: str) -> None:
         st.info(f"Status: {status} · {processed}/{total} processed")
         st.progress(processed / total if total else 0.0)
 
-    # Per-stage progress bars.
     for key, label, desc in STAGES:
         sp = progress.get(key) or {}
         done, st_total = sp.get("done", 0), sp.get("total", 0)
@@ -228,51 +230,60 @@ def progress_view(job_id: str) -> None:
         st.progress(min(max(pct, 0.0), 1.0))
 
     if is_complete:
-        st.session_state["done_job"] = job_id
-        render_results(job_id, counts)
+        render_results(job_id)
 
 
-# ── Page ──────────────────────────────────────────────────────────────────
+# ── Page ───────────────────────────────────────────────────────────────────
 st.title("✉️ EmailVerify")
 st.caption("Validate email lists in minutes. No guessing.")
 
-st.warning(
-    "⚠️ **Port 25 caveat:** mailbox (SMTP) verification needs outbound port 25 "
-    "on the host running FastAPI. Cloud hosts often block it — affected addresses "
-    "land in `reserved / temp_error`. This is an infra limit, not a bug.",
-    icon="⚠️",
+st.info(
+    "Runs entirely in this Streamlit process — no separate backend. Mailbox "
+    "(SMTP) checks egress on **port 25** from wherever this app runs. If port 25 "
+    "is blocked, those addresses land in `reserved / smtp_connection_failed`. "
+    "Use the self-test below to confirm port 25 is open.",
+    icon="ℹ️",
 )
 
-with st.expander("Backend connection", expanded=False):
-    st.code(BACKEND_URL, language="text")
-    if not backend_ok():
-        st.error("Cannot reach the FastAPI backend. Start it with "
-                 "`uvicorn app.main:app --port 8000` or set BACKEND_URL.")
+with st.expander("🔌 SMTP port-25 self-test", expanded=False):
+    test_email = st.text_input(
+        "Probe a real address to confirm port 25 egress",
+        value="postmaster@gmail.com", key="selftest_email",
+    )
+    if st.button("Run port-25 test", disabled=not test_email.strip()):
+        with st.spinner("Connecting on port 25…"):
+            try:
+                out = smtp_selftest(test_email.strip())
+            except Exception as err:  # noqa: BLE001
+                out = {"ok": False, "detail": str(err)}
+        if out.get("ok"):
+            st.success(f"Port 25 reachable ✓  MX={out.get('mx')}  "
+                       f"code={out.get('code')}  sub_status={out.get('sub_status')}")
+        else:
+            st.error("Port 25 NOT reachable / no SMTP banner — "
+                     f"{out.get('detail') or out.get('sub_status')}. "
+                     "Mailbox verification will not work here.")
 
 tab_single, tab_csv = st.tabs(["Single email", "CSV / Excel upload"])
 
 with tab_single:
     email = st.text_input("Email address", placeholder="someone@example.com")
     if st.button("Validate email", type="primary", disabled=not email.strip()):
-        try:
-            resp = submit_emails([email.strip()])
-            st.session_state["job_id"] = resp["jobId"]
-            st.session_state.pop("done_job", None)
-            st.toast(f"Job {resp['jobId'][:8]} created ({resp['total']} email)")
-        except Exception as err:
-            st.error(f"Submit failed: {err}")
+        jid = start_job([email.strip()], "single")
+        st.session_state["job_id"] = jid
+        st.toast(f"Job {jid[:8]} started (1 email)")
 
 with tab_csv:
     st.write("Upload a CSV/XLSX. Any email-like cell is extracted (matches `sample_test.csv`).")
     upload = st.file_uploader("Choose file", type=["csv", "xlsx", "xls"])
     if st.button("Validate file", type="primary", disabled=upload is None):
-        try:
-            resp = submit_file(upload.name, upload.getvalue())
-            st.session_state["job_id"] = resp["jobId"]
-            st.session_state.pop("done_job", None)
-            st.toast(f"Job {resp['jobId'][:8]} created ({resp['total']} emails)")
-        except Exception as err:
-            st.error(f"Submit failed: {err}")
+        emails = extract_emails(upload.name, upload.getvalue())
+        if not emails:
+            st.error("No email-like cells found in that file.")
+        else:
+            jid = start_job(emails, upload.name)
+            st.session_state["job_id"] = jid
+            st.toast(f"Job {jid[:8]} started ({len(emails)} emails)")
 
 job_id = st.session_state.get("job_id")
 if job_id:
