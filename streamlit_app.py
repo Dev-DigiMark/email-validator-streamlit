@@ -397,6 +397,14 @@ if job_id:
     # re-checks the status; when it reaches complete/failed no rerun is
     # scheduled, so status reads stop the moment results are ready.
     _job = job_store.get(job_id)
-    if _job and _job.get("status") not in ("complete", "failed"):
+    _running = bool(_job) and _job.get("status") not in ("complete", "failed")
+
+    # Visible proof: this stamp ticks every second while polling, then freezes
+    # once the job is done — even though Streamlit's own /api/v2/app/status
+    # health pings keep going (those are the platform's, not ours).
+    if _running:
+        st.caption(f"↻ refreshing — {time.strftime('%H:%M:%S')}")
         time.sleep(1)
         st.rerun()
+    else:
+        st.caption(f"■ idle — our polling stopped (last update {time.strftime('%H:%M:%S')})")
