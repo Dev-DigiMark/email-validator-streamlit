@@ -82,27 +82,82 @@ def start_job(emails: list[str], filename: str) -> str:
     return job_id
 
 
-def extract_emails(name: str, data: bytes) -> list[str]:
-    """Extract emails from the single column that contains the most of them.
+def _norm(email: str | None) -> str:
+    return (email or "").lower().strip()
 
-    Scanning every cell double-counts files that repeat the address across
-    columns (and picks up stray matches in description columns), so we choose
-    the one email-bearing column and read it top-to-bottom. Duplicates within
-    that column are kept — the pipeline flags them as `duplicate`."""
+
+def _first_email(cell) -> str | None:
+    """Clean email match in a cell, or None — used to detect the email column."""
+    if isinstance(cell, str):
+        found = EMAIL_RE.findall(cell)
+        if found:
+            return found[0]
+    return None
+
+
+def _row_email(cell) -> str | None:
+    """The email to validate for a row: a clean match if present, otherwise the
+    raw non-empty cell (so malformed entries like `user@@x.com` still get
+    validated and come back invalid, rather than being dropped)."""
+    if not isinstance(cell, str):
+        return None
+    s = cell.strip()
+    if not s:
+        return None
+    found = EMAIL_RE.findall(s)
+    return found[0] if found else s
+
+
+def parse_upload(name: str, data: bytes):
+    """Read the uploaded file preserving its original columns, identify the
+    email-bearing column, and return (original_df, row_emails) where row_emails
+    holds one email (or None) per row aligned to the dataframe — so we can map
+    validation statuses back onto the user's own rows later."""
     name = name.lower()
-    if name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
-    else:
-        df = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
-    best: list[str] = []
-    for col in df.columns:
-        col_emails: list[str] = []
-        for val in df[col].tolist():
-            if isinstance(val, str):
-                col_emails.extend(EMAIL_RE.findall(val))
-        if len(col_emails) > len(best):
-            best = col_emails
-    return best
+    reader = pd.read_excel if name.endswith((".xlsx", ".xls")) else pd.read_csv
+
+    df = reader(io.BytesIO(data), dtype=str)
+
+    def col_score(col) -> int:
+        return sum(1 for v in df[col].tolist() if _first_email(v))
+
+    if len(df.columns) == 0:
+        return df, []
+    email_col = max(df.columns, key=col_score)
+    if col_score(email_col) == 0:
+        return df, []
+
+    # Headerless heuristic: if the detected column's *name* is itself an email,
+    # the file had no header row (pandas ate the first email) — re-read raw.
+    if isinstance(email_col, str) and EMAIL_RE.findall(email_col):
+        df = reader(io.BytesIO(data), header=None, dtype=str)
+        email_col = max(df.columns, key=col_score)
+
+    row_emails = [_row_email(v) for v in df[email_col].tolist()]
+    return df, row_emails
+
+
+def build_result_df(results: list[dict], in_df: pd.DataFrame, row_emails: list) -> pd.DataFrame:
+    """Return the original file with a single `status` column added (or the
+    existing one updated). Each row's status is looked up by its email; the real
+    verdict wins over a `duplicate` marker so repeated rows all show the verdict."""
+    status_by_email: dict[str, str] = {}
+    for r in results:
+        e = _norm(r.get("email"))
+        if not e:
+            continue
+        if e not in status_by_email or r.get("status") != "duplicate":
+            status_by_email[e] = _status_label(r.get("status", ""))
+
+    out = in_df.copy()
+    statuses = [status_by_email.get(_norm(e), "") if e else "" for e in row_emails]
+
+    target = next(
+        (c for c in out.columns if isinstance(c, str) and c.strip().lower() == "status"),
+        None,
+    )
+    out[target or "status"] = statuses
+    return out
 
 
 def df_to_xlsx(df: pd.DataFrame) -> bytes:
@@ -198,7 +253,19 @@ def render_results(job_id: str) -> None:
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-    # Downloads respect the active filters — export exactly what's shown above.
+    # Build the download. For file uploads, keep the user's ORIGINAL columns and
+    # just add/update a single `status` column; for a single-email check, fall
+    # back to the rich table. Either way filter to match the on-screen view.
+    in_df = st.session_state.get("input_df")
+    row_emails = st.session_state.get("input_row_emails")
+    if in_df is not None and row_emails is not None:
+        allowed = {_norm(e) for e in view["email"].tolist()}
+        result_df = build_result_df(results, in_df, row_emails)
+        keep = [bool(e) and _norm(e) in allowed for e in row_emails]
+        download_df = result_df[pd.Series(keep, index=result_df.index)]
+    else:
+        download_df = view
+
     fname = "results"
     if sel_status != "(all)":
         fname += f"_{sel_status}"
@@ -206,14 +273,14 @@ def render_results(job_id: str) -> None:
         fname += f"_{sel_sub}"
 
     dcol1, dcol2 = st.columns(2)
-    dcol1.caption(f"Exporting {len(view)} of {len(df)} rows")
+    dcol1.caption(f"Exporting {len(download_df)} rows")
     dcol2.caption("")
     dcol1.download_button(
-        "⬇ Download CSV", data=view.to_csv(index=False).encode("utf-8"),
+        "⬇ Download CSV", data=download_df.to_csv(index=False).encode("utf-8"),
         file_name=f"{fname}.csv", mime="text/csv", key=f"csv_{job_id}",
     )
     dcol2.download_button(
-        "⬇ Download XLSX", data=df_to_xlsx(view),
+        "⬇ Download XLSX", data=df_to_xlsx(download_df),
         file_name=f"{fname}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"xlsx_{job_id}",
@@ -300,18 +367,24 @@ with tab_single:
     if st.button("Validate email", type="primary", disabled=not email.strip()):
         jid = start_job([email.strip()], "single")
         st.session_state["job_id"] = jid
+        st.session_state["input_df"] = None         # single email → rich download
+        st.session_state["input_row_emails"] = None
         st.toast(f"Job {jid[:8]} started (1 email)")
 
 with tab_csv:
-    st.write("Upload a CSV/XLSX. Any email-like cell is extracted (matches `sample_test.csv`).")
+    st.write("Upload a CSV/XLSX. The result file keeps your original columns and "
+             "adds (or updates) a single `status` column.")
     upload = st.file_uploader("Choose file", type=["csv", "xlsx", "xls"])
     if st.button("Validate file", type="primary", disabled=upload is None):
-        emails = extract_emails(upload.name, upload.getvalue())
+        in_df, row_emails = parse_upload(upload.name, upload.getvalue())
+        emails = [e for e in row_emails if e]
         if not emails:
             st.error("No email-like cells found in that file.")
         else:
             jid = start_job(emails, upload.name)
             st.session_state["job_id"] = jid
+            st.session_state["input_df"] = in_df
+            st.session_state["input_row_emails"] = row_emails
             st.toast(f"Job {jid[:8]} started ({len(emails)} emails)")
 
 job_id = st.session_state.get("job_id")
