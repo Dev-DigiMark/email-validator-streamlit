@@ -198,14 +198,23 @@ def render_results(job_id: str) -> None:
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
+    # Downloads respect the active filters — export exactly what's shown above.
+    fname = "results"
+    if sel_status != "(all)":
+        fname += f"_{sel_status}"
+    if sel_sub != "(all)":
+        fname += f"_{sel_sub}"
+
     dcol1, dcol2 = st.columns(2)
+    dcol1.caption(f"Exporting {len(view)} of {len(df)} rows")
+    dcol2.caption("")
     dcol1.download_button(
-        "⬇ Download CSV", data=df.to_csv(index=False).encode("utf-8"),
-        file_name="results_all.csv", mime="text/csv", key=f"csv_{job_id}",
+        "⬇ Download CSV", data=view.to_csv(index=False).encode("utf-8"),
+        file_name=f"{fname}.csv", mime="text/csv", key=f"csv_{job_id}",
     )
     dcol2.download_button(
-        "⬇ Download XLSX", data=df_to_xlsx(df),
-        file_name="results_all.xlsx",
+        "⬇ Download XLSX", data=df_to_xlsx(view),
+        file_name=f"{fname}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"xlsx_{job_id}",
     )
