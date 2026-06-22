@@ -237,14 +237,6 @@ def progress_view(job_id: str) -> None:
 st.title("✉️ EmailVerify")
 st.caption("Validate email lists in minutes. No guessing.")
 
-st.info(
-    "Runs entirely in this Streamlit process — no separate backend. Mailbox "
-    "(SMTP) checks egress on **port 25** from wherever this app runs. If port 25 "
-    "is blocked, those addresses land in `reserved / smtp_connection_failed`. "
-    "Use the self-test below to confirm port 25 is open.",
-    icon="ℹ️",
-)
-
 with st.expander("🔌 SMTP port-25 self-test", expanded=False):
     test_email = st.text_input(
         "Probe a real address to confirm port 25 egress",
