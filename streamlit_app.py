@@ -40,10 +40,18 @@ STAGES = [
 STATUS_LABELS = {
     "valid": "Valid",
     "invalid": "Invalid",
-    "reserved": "Reserved",
+    "reserved": "Risky",
     "do_not_use": "Do not use",
     "duplicate": "Duplicate",
 }
+
+# Internal status string -> user-facing label. The pipeline/model/exports keep
+# "reserved"; the UI shows "risky" because it reads better for unverifiable leads.
+STATUS_DISPLAY = {"reserved": "risky"}
+
+
+def _status_label(status: str) -> str:
+    return STATUS_DISPLAY.get(status, status)
 
 DISPLAY_COLUMNS = [
     "email", "status", "sub_status", "score", "confidence", "flags",
@@ -131,7 +139,7 @@ def _to_dataframe(results: list[dict]) -> pd.DataFrame:
         breakdown = r.get("score_breakdown") or []
         rows.append({
             "email": r.get("email", ""),
-            "status": r.get("status", ""),
+            "status": _status_label(r.get("status", "")),
             "sub_status": r.get("sub_status", ""),
             "score": r.get("score"),
             "confidence": r.get("confidence", ""),
