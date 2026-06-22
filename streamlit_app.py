@@ -211,11 +211,9 @@ def render_results(job_id: str) -> None:
     )
 
 
-# ── Progress fragment ──────────────────────────────────────────────────────
-# Polls the in-process store ONLY while the job is running. Once the job is
-# complete/failed it renders the final state and returns without scheduling
-# another rerun — so no status calls happen when nothing is running.
-@st.fragment
+# ── Progress + results renderer ────────────────────────────────────────────
+# Pure render — no polling here. The 1s refresh loop lives at the call site and
+# only runs while the job is active, so no status reads happen when idle.
 def progress_view(job_id: str) -> None:
     job = job_store.get(job_id)
     if job is None:
@@ -261,12 +259,6 @@ def progress_view(job_id: str) -> None:
 
     if is_complete:
         render_results(job_id)
-        return  # done → stop polling (no further reruns scheduled)
-
-    # Still running → poll again in 1s. scope="fragment" reruns only this
-    # fragment, not the whole app, and stops automatically once complete.
-    time.sleep(1)
-    st.rerun(scope="fragment")
 
 
 # ── Page ───────────────────────────────────────────────────────────────────
@@ -318,3 +310,11 @@ if job_id:
     st.divider()
     st.subheader(f"Job {job_id}")
     progress_view(job_id)
+
+    # Refresh once per second ONLY while the job is still running. Each rerun
+    # re-checks the status; when it reaches complete/failed no rerun is
+    # scheduled, so status reads stop the moment results are ready.
+    _job = job_store.get(job_id)
+    if _job and _job.get("status") not in ("complete", "failed"):
+        time.sleep(1)
+        st.rerun()
