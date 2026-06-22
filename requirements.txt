@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+dnspython
+python-whois
+pandas
+openpyxl
+pydantic
+streamlit
+pytest
+pytest-asyncio

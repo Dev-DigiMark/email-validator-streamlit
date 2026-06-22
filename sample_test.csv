@@ -1,0 +1,31 @@
+email,expected_scenario
+invalidemail,invalid | syntax_error — no @ symbol
+user@@double.com,invalid | syntax_error — multiple @ symbols
+user!tag@gmail.com,invalid | syntax_error — illegal character (!)
+.dotstart@gmail.com,invalid | dot_rule_violation — local part starts with dot
+user..name@gmail.com,invalid | dot_rule_violation — consecutive dots
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@x.com,invalid | length_exceeded — local part is 65 chars (max 64)
+test@domain.faketest123,invalid | invalid_tld — TLD not in valid list
+spamtrap@gmail.com,do_not_use | spam_trap_keyword — contains keyword 'spam'
+honeypot@yahoo.com,do_not_use | spam_trap_keyword — contains keyword 'honeypot'
+noreply@apple.com,do_not_use | role_rejected — 'noreply' is in rejected roles list
+donotreply@amazon.com,do_not_use | role_rejected — 'donotreply' is in rejected roles list
+no-reply@netflix.com,do_not_use | role_rejected — 'no-reply' is in rejected roles list
+random123@mailinator.com,do_not_use | disposable — mailinator.com is a known disposable domain
+test456@yopmail.com,do_not_use | disposable — yopmail.com is a known disposable domain
+john.doe@gmail.com,Stage 1 pass — flags: alias_detected + free_provider (normalised: johndoe@gmail.com)
+johndoe@gmail.com,duplicate — same normalised address as john.doe@gmail.com above
+john.doe+promo@gmail.com,duplicate — alias (+ stripped) also normalises to johndoe@gmail.com
+user@gmial.com,typo_suggestion flag (gmial → gmail) — then DNS stage result
+test@thisfakedomain-doesnotexist-xyz99999.com,reserved | domain_not_found — NXDOMAIN
+user@nodomain-xyz12345.net,reserved | domain_not_found — NXDOMAIN
+user@example.com,reserved | no_mx_record — example.com has A record but no MX
+xyznotarealuserxyz9999@gmail.com,invalid | mailbox_not_found — fake Gmail mailbox
+notarealuser99xyz@hotmail.com,invalid | mailbox_not_found — fake Hotmail mailbox
+usmanamirparwaz@gmail.com,valid | smtp_confirmed — real mailbox verified by SMTP
+xyzfaketest99@yahoo.com,reserved | accept_all — Yahoo is catch-all (or mailbox_not_found)
+info@github.com,flags: role_address — 'info' is a flagged role; SMTP result varies
+admin@stackoverflow.com,flags: role_address — 'admin' is a flagged role; SMTP result varies
+support@cloudflare.com,flags: role_address — 'support' is a flagged role; SMTP result varies
+billing@stripe.com,flags: role_address — 'billing' is a flagged role; SMTP result varies
+contact@proton.me,flags: role_address + free_provider — 'contact' flagged; SMTP result varies
