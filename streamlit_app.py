@@ -222,10 +222,19 @@ def progress_view(job_id: str) -> None:
     for key, label, desc in STAGES:
         sp = progress.get(key) or {}
         done, st_total = sp.get("done", 0), sp.get("total", 0)
-        pct = (done / st_total) if st_total else (1.0 if is_complete else 0.0)
-        bar_label = f"{label} — {done}/{st_total}"
-        if key == "stage1" and sp:
-            bar_label += f" ({sp.get('passed', 0)} passed, {sp.get('filtered', 0)} filtered)"
+        if st_total:
+            pct = done / st_total
+            bar_label = f"{label} — {done}/{st_total}"
+            if key == "stage1":
+                bar_label += f" ({sp.get('passed', 0)} passed, {sp.get('filtered', 0)} filtered)"
+        elif is_complete:
+            # Nothing reached this stage (e.g. no reserved addresses for scoring) —
+            # show an empty bar rather than a misleading full one.
+            pct = 0.0
+            bar_label = f"{label} — none to process"
+        else:
+            pct = 0.0
+            bar_label = f"{label} — 0/0"
         st.caption(f"{bar_label}  ·  {desc}")
         st.progress(min(max(pct, 0.0), 1.0))
 
