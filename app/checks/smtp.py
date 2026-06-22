@@ -407,9 +407,35 @@ async def check_mailbox(email: str, mx_host: str) -> SMTPCheckResult:
     """
     inferred_provider = _infer_provider_from_mx_host(mx_host)
     any_accessible = False
+    smtp_cfg = CONFIG["smtp"]
 
-    for entry in CONFIG["smtp"]["ports"]:
-        result = await _do_smtp_check(email, mx_host, entry["port"], entry["mode"], inferred_provider)
+    # Hard per-port budget. The inner _do_smtp_check already times out each
+    # individual read/connect, but a host that stalls the STARTTLS handshake
+    # (writer.start_tls) or drips bytes forever isn't otherwise bounded — and a
+    # single such host would hang the whole batch's final gather. wait_for caps
+    # the entire per-port conversation (banner→EHLO→STARTTLS→MAIL→RCPT = 6 reads).
+    port_budget = (
+        smtp_cfg["connectTimeoutMs"] / 1000
+        + smtp_cfg["responseTimeoutMs"] / 1000 * 6
+        + 2
+    )
+
+    async def guarded(host: str, port: int, mode: str, provider) -> _Internal:
+        try:
+            return await asyncio.wait_for(
+                _do_smtp_check(email, host, port, mode, provider), port_budget
+            )
+        except asyncio.TimeoutError:
+            # Overall stall → smtp_timeout (tcp_failed/start_tls_failed False so
+            # check_mailbox returns it as-is instead of falling through forever).
+            return _Internal(
+                exists=None, is_catch_all=False, sub_status="smtp_timeout",
+                should_retry=False, smtp_accessible=False,
+                tcp_failed=False, start_tls_failed=False,
+            )
+
+    for entry in smtp_cfg["ports"]:
+        result = await guarded(mx_host, entry["port"], entry["mode"], inferred_provider)
         if result.smtp_accessible:
             any_accessible = True
         if not result.tcp_failed and not result.start_tls_failed:
@@ -419,7 +445,7 @@ async def check_mailbox(email: str, mx_host: str) -> SMTPCheckResult:
     # All ports on mx_host failed at TCP/TLS level — try bare domain on port 25
     domain = email[email.index("@") + 1:]
     if domain and domain != mx_host:
-        fallback = await _do_smtp_check(email, domain, 25, "plain", _infer_provider_from_mx_host(domain))
+        fallback = await guarded(domain, 25, "plain", _infer_provider_from_mx_host(domain))
         if fallback.smtp_accessible:
             any_accessible = True
         if not fallback.tcp_failed and not fallback.start_tls_failed:
