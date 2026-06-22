@@ -74,17 +74,26 @@ def start_job(emails: list[str], filename: str) -> str:
 
 
 def extract_emails(name: str, data: bytes) -> list[str]:
-    """Pull every email-like cell out of a CSV/XLSX (header-agnostic)."""
+    """Extract emails from the single column that contains the most of them.
+
+    Scanning every cell double-counts files that repeat the address across
+    columns (and picks up stray matches in description columns), so we choose
+    the one email-bearing column and read it top-to-bottom. Duplicates within
+    that column are kept — the pipeline flags them as `duplicate`."""
     name = name.lower()
     if name.endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(data), header=None, dtype=str)
     else:
         df = pd.read_csv(io.BytesIO(data), header=None, dtype=str)
-    emails: list[str] = []
-    for val in df.values.ravel():
-        if isinstance(val, str):
-            emails.extend(EMAIL_RE.findall(val))
-    return emails
+    best: list[str] = []
+    for col in df.columns:
+        col_emails: list[str] = []
+        for val in df[col].tolist():
+            if isinstance(val, str):
+                col_emails.extend(EMAIL_RE.findall(val))
+        if len(col_emails) > len(best):
+            best = col_emails
+    return best
 
 
 def df_to_xlsx(df: pd.DataFrame) -> bytes:
