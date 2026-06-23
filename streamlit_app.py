@@ -1,18 +1,20 @@
-"""Streamlit-only email-validation app with resumable, disk-checkpointed jobs.
+"""Streamlit-only email-validation app (single process, no backend).
 
-The job is a durable record identified by a job_id carried in the URL (?job=...).
-A background worker processes the emails in CHUNKS and checkpoints to disk after
-each chunk. If the window sleeps / goes black / is reopened, the page re-attaches
-to the job by its URL id and the worker RESUMES from the last checkpoint instead
-of dying — so a long 5k batch survives interruptions and finishes.
+Repo-root entrypoint for Streamlit Cloud. The 4-stage pipeline runs IN-PROCESS:
+streamlit_app.py imports app.pipeline.runner and calls run_pipeline directly in
+a background thread, writing progress/results into the in-memory job_store. The
+UI fragment polls that store every second. There is NO FastAPI server and NO
+BACKEND_URL — SMTP probes egress straight from this process on port 25.
 
-Run locally:  streamlit run streamlit_app.py
-Deploy:       Streamlit Cloud, main file = streamlit_app.py. SMTP needs port 25.
+Run locally:
+    streamlit run streamlit_app.py
+
+Deploy: Streamlit Community Cloud, main file = streamlit_app.py. SMTP mailbox
+verification requires outbound port 25 from wherever this process runs.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import io
 import re
 import threading
@@ -25,15 +27,14 @@ import streamlit as st
 from app.checks.dns import check_domain
 from app.checks.smtp import check_mailbox
 from app.pipeline.runner import run_pipeline
-from app.store import persist
 from app.store.jobs import job_store
 
-# ── Config ─────────────────────────────────────────────────────────────────
-CHUNK_SIZE = 100  # emails per checkpoint; smaller = more frequent saves
-
-STATUS_KEYS = [
-    "valid", "invalid", "reserved", "do_not_use", "duplicate",
-    "promoted_to_valid", "demoted_to_invalid",
+# ── Stages / labels / columns (frontend feature parity) ────────────────────
+STAGES = [
+    ("stage1", "Pre-flight checks", "Syntax, duplicates, lists"),
+    ("stage2", "DNS verification", "MX records, SPF/DMARC, blacklists"),
+    ("stage3", "Mailbox verification", "SMTP handshake, catch-all detection"),
+    ("stage4", "Confidence scoring", "Promoting high-confidence leads"),
 ]
 
 STATUS_LABELS = {
@@ -44,7 +45,13 @@ STATUS_LABELS = {
     "duplicate": "Duplicate",
 }
 
+# Internal status string -> user-facing label. The pipeline/model/exports keep
+# "reserved"; the UI shows "risky" because it reads better for unverifiable leads.
 STATUS_DISPLAY = {"reserved": "risky"}
+
+
+def _status_label(status: str) -> str:
+    return STATUS_DISPLAY.get(status, status)
 
 DISPLAY_COLUMNS = [
     "email", "status", "sub_status", "score", "confidence", "flags",
@@ -58,38 +65,29 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 st.set_page_config(page_title="EmailVerify", page_icon="✉️", layout="wide")
 
 
-def _status_label(status: str) -> str:
-    return STATUS_DISPLAY.get(status, status)
+# ── In-process job launch ──────────────────────────────────────────────────
+def _run_in_thread(emails: list[str], job_id: str) -> None:
+    """Run the async pipeline in its own event loop on a daemon thread so the
+    Streamlit script/fragment never blocks. The job_store singleton is shared
+    module state, so the UI thread sees progress as it's written."""
+    asyncio.run(run_pipeline(emails, job_id))
 
 
-# ── Durable master-job store (memory cache + disk) ─────────────────────────
-_MASTER: dict[str, dict] = {}
-_MASTER_LOCK = threading.Lock()
-_ACTIVE: set[str] = set()  # job_ids with a live worker thread in THIS process
+def start_job(emails: list[str], filename: str) -> str:
+    job_id = uuid.uuid4().hex
+    job_store.create(job_id, filename, len(emails))
+    threading.Thread(
+        target=_run_in_thread, args=(emails, job_id), daemon=True
+    ).start()
+    return job_id
 
 
-def get_master(job_id: str) -> dict | None:
-    """Return the job record from the in-memory cache, loading from disk (e.g.
-    after a cold start / reopen) if it isn't cached yet."""
-    rec = _MASTER.get(job_id)
-    if rec is None:
-        rec = persist.load(job_id)
-        if rec is not None:
-            _MASTER[job_id] = rec
-    return rec
-
-
-def save_master(rec: dict) -> None:
-    _MASTER[rec["id"]] = rec
-    persist.save(rec)
-
-
-# ── Email parsing (keep original columns) ──────────────────────────────────
 def _norm(email: str | None) -> str:
     return (email or "").lower().strip()
 
 
 def _first_email(cell) -> str | None:
+    """Clean email match in a cell, or None — used to detect the email column."""
     if isinstance(cell, str):
         found = EMAIL_RE.findall(cell)
         if found:
@@ -98,6 +96,9 @@ def _first_email(cell) -> str | None:
 
 
 def _row_email(cell) -> str | None:
+    """The email to validate for a row: a clean match if present, otherwise the
+    raw non-empty cell (so malformed entries like `user@@x.com` still get
+    validated and come back invalid, rather than being dropped)."""
     if not isinstance(cell, str):
         return None
     s = cell.strip()
@@ -108,10 +109,13 @@ def _row_email(cell) -> str | None:
 
 
 def parse_upload(name: str, data: bytes):
-    """Read the file keeping its original columns; return (df, row_emails) with
-    one email (or None) per row aligned to the dataframe."""
+    """Read the uploaded file preserving its original columns, identify the
+    email-bearing column, and return (original_df, row_emails) where row_emails
+    holds one email (or None) per row aligned to the dataframe — so we can map
+    validation statuses back onto the user's own rows later."""
     name = name.lower()
     reader = pd.read_excel if name.endswith((".xlsx", ".xls")) else pd.read_csv
+
     df = reader(io.BytesIO(data), dtype=str)
 
     def col_score(col) -> int:
@@ -122,6 +126,9 @@ def parse_upload(name: str, data: bytes):
     email_col = max(df.columns, key=col_score)
     if col_score(email_col) == 0:
         return df, []
+
+    # Headerless heuristic: if the detected column's *name* is itself an email,
+    # the file had no header row (pandas ate the first email) — re-read raw.
     if isinstance(email_col, str) and EMAIL_RE.findall(email_col):
         df = reader(io.BytesIO(data), header=None, dtype=str)
         email_col = max(df.columns, key=col_score)
@@ -131,7 +138,9 @@ def parse_upload(name: str, data: bytes):
 
 
 def build_result_df(results: list[dict], in_df: pd.DataFrame, row_emails: list) -> pd.DataFrame:
-    """Original file + a single added/updated `status` column."""
+    """Return the original file with a single `status` column added (or the
+    existing one updated). Each row's status is looked up by its email; the real
+    verdict wins over a `duplicate` marker so repeated rows all show the verdict."""
     status_by_email: dict[str, str] = {}
     for r in results:
         e = _norm(r.get("email"))
@@ -142,6 +151,7 @@ def build_result_df(results: list[dict], in_df: pd.DataFrame, row_emails: list) 
 
     out = in_df.copy()
     statuses = [status_by_email.get(_norm(e), "") if e else "" for e in row_emails]
+
     target = next(
         (c for c in out.columns if isinstance(c, str) and c.strip().lower() == "status"),
         None,
@@ -157,94 +167,6 @@ def df_to_xlsx(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-# ── Chunked worker (resumable) ─────────────────────────────────────────────
-async def _validate_chunk(emails: list[str]):
-    """Run the full pipeline on one chunk via a throwaway sub-job; return
-    (result_dicts, status_counts)."""
-    sub_id = uuid.uuid4().hex
-    job_store.create(sub_id, "chunk", len(emails))
-    try:
-        await run_pipeline(emails, sub_id)
-        sub = job_store.get(sub_id)
-        results = [r.model_dump() for r in sub["results"]]
-        counts = {k: sub["counts"].get(k, 0) for k in STATUS_KEYS}
-        return results, counts
-    finally:
-        job_store.delete(sub_id)
-
-
-def _worker(job_id: str) -> None:
-    """Process remaining chunks, checkpointing after each. Resumes from
-    rec['done'] so an interrupted job continues instead of restarting."""
-    try:
-        while True:
-            rec = get_master(job_id)
-            if rec is None:
-                return
-            emails = rec["emails"]
-            done = rec["done"]
-            if done >= len(emails):
-                rec["status"] = "complete"
-                rec["counts"]["processed"] = done
-                save_master(rec)
-                return
-
-            chunk = emails[done:done + CHUNK_SIZE]
-            try:
-                results, counts = asyncio.run(_validate_chunk(chunk))
-            except Exception as err:  # noqa: BLE001
-                rec = get_master(job_id) or rec
-                rec["status"] = "failed"
-                rec["error"] = str(err)
-                save_master(rec)
-                return
-
-            rec = get_master(job_id) or rec
-            rec["results"].extend(results)
-            for k in STATUS_KEYS:
-                rec["counts"][k] = rec["counts"].get(k, 0) + counts.get(k, 0)
-            rec["done"] = done + len(chunk)
-            rec["counts"]["processed"] = rec["done"]
-            rec["status"] = "complete" if rec["done"] >= len(emails) else "running"
-            save_master(rec)
-    finally:
-        with _MASTER_LOCK:
-            _ACTIVE.discard(job_id)
-
-
-def ensure_worker(job_id: str) -> None:
-    """Start (or restart, after a reopen/cold-start) the worker if the job is
-    unfinished and not already being processed in this process."""
-    with _MASTER_LOCK:
-        if job_id in _ACTIVE:
-            return
-        rec = get_master(job_id)
-        if not rec or rec["status"] in ("complete", "failed"):
-            return
-        _ACTIVE.add(job_id)
-    threading.Thread(target=_worker, args=(job_id,), daemon=True).start()
-
-
-def create_job(emails: list[str], name: str, input_bytes: bytes | None) -> str:
-    job_id = uuid.uuid4().hex
-    rec = {
-        "id": job_id,
-        "filename": name,
-        "total": len(emails),
-        "emails": emails,
-        "results": [],
-        "done": 0,
-        "status": "running",
-        "error": None,
-        "counts": {**{k: 0 for k in STATUS_KEYS}, "total": len(emails), "processed": 0},
-        "input_b64": base64.b64encode(input_bytes).decode() if input_bytes else None,
-        "input_name": name if input_bytes else None,
-    }
-    save_master(rec)
-    ensure_worker(job_id)
-    return job_id
-
-
 # ── SMTP port-25 self-test ─────────────────────────────────────────────────
 def smtp_selftest(email: str) -> dict:
     async def _run() -> dict:
@@ -253,8 +175,13 @@ def smtp_selftest(email: str) -> dict:
         if not dns.mx_record:
             return {"ok": False, "detail": f"No MX record for {domain}"}
         res = await check_mailbox(email, dns.mx_record)
-        return {"ok": bool(res.smtp_accessible), "mx": dns.mx_record,
-                "code": res.smtp_response_code, "sub_status": res.sub_status}
+        return {
+            "ok": bool(res.smtp_accessible),
+            "mx": dns.mx_record,
+            "code": res.smtp_response_code,
+            "sub_status": res.sub_status,
+            "response": res.smtp_response,
+        }
 
     return asyncio.run(_run())
 
@@ -292,17 +219,31 @@ def _to_dataframe(results: list[dict]) -> pd.DataFrame:
     return df[cols] if cols else df
 
 
-def render_results(rec: dict) -> None:
-    results = rec["results"]
-    if not results:
+def render_results(job_id: str) -> None:
+    job = job_store.get(job_id)
+    if not job:
         return
+    results = [r.model_dump() for r in job["results"]]
+    counts = job["counts"]
+
+    st.subheader(f"Results · {len(results)} emails")
+
+    cols = st.columns(len(STATUS_LABELS))
+    for col, (key, label) in zip(cols, STATUS_LABELS.items()):
+        col.metric(label, counts.get(key, 0))
+
+    promoted = counts.get("promoted_to_valid", 0)
+    demoted = counts.get("demoted_to_invalid", 0)
+    if promoted or demoted:
+        st.caption(f"Promotions: {promoted} promoted to valid · {demoted} demoted to invalid")
+
     df = _to_dataframe(results)
 
     fcol1, fcol2 = st.columns(2)
     status_opts = ["(all)"] + sorted(df["status"].dropna().unique().tolist()) if "status" in df else ["(all)"]
     sub_opts = ["(all)"] + sorted(df["sub_status"].dropna().unique().tolist()) if "sub_status" in df else ["(all)"]
-    sel_status = fcol1.selectbox("Filter by status", status_opts, key=f"st_{rec['id']}")
-    sel_sub = fcol2.selectbox("Filter by sub_status", sub_opts, key=f"sub_{rec['id']}")
+    sel_status = fcol1.selectbox("Filter by status", status_opts, key=f"st_{job_id}")
+    sel_sub = fcol2.selectbox("Filter by sub_status", sub_opts, key=f"sub_{job_id}")
 
     view = df
     if sel_status != "(all)":
@@ -312,11 +253,12 @@ def render_results(rec: dict) -> None:
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-    # Build download: original columns + status for uploads, else the rich table.
-    if rec.get("input_b64"):
-        in_df, row_emails = parse_upload(
-            rec["input_name"] or "upload.csv", base64.b64decode(rec["input_b64"])
-        )
+    # Build the download. For file uploads, keep the user's ORIGINAL columns and
+    # just add/update a single `status` column; for a single-email check, fall
+    # back to the rich table. Either way filter to match the on-screen view.
+    in_df = st.session_state.get("input_df")
+    row_emails = st.session_state.get("input_row_emails")
+    if in_df is not None and row_emails is not None:
         allowed = {_norm(e) for e in view["email"].tolist()}
         result_df = build_result_df(results, in_df, row_emails)
         keep = [bool(e) and _norm(e) in allowed for e in row_emails]
@@ -332,60 +274,124 @@ def render_results(rec: dict) -> None:
 
     dcol1, dcol2 = st.columns(2)
     dcol1.caption(f"Exporting {len(download_df)} rows")
+    dcol2.caption("")
     dcol1.download_button(
         "⬇ Download CSV", data=download_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{fname}.csv", mime="text/csv", key=f"csv_{rec['id']}",
+        file_name=f"{fname}.csv", mime="text/csv", key=f"csv_{job_id}",
     )
     dcol2.download_button(
         "⬇ Download XLSX", data=df_to_xlsx(download_df),
         file_name=f"{fname}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"xlsx_{rec['id']}",
+        key=f"xlsx_{job_id}",
     )
 
 
-def render_job(job_id: str) -> str | None:
-    rec = get_master(job_id)
-    if not rec:
-        st.warning("Job not found (it may have expired after a full restart). "
-                   "Re-upload to start again.")
-        return None
+# ── Progress + results renderer ────────────────────────────────────────────
+# Pure render — no polling here. The 1s refresh loop lives at the call site and
+# only runs while the job is active, so no status reads happen when idle.
+def progress_view(job_id: str) -> None:
+    job = job_store.get(job_id)
+    if job is None:
+        st.error("Job not found.")
+        return
 
-    # Auto-resume: if it's unfinished, make sure a worker is running (this is
-    # what restarts processing after a reopen / cold start).
-    ensure_worker(job_id)
+    status = job.get("status", "pending")
+    counts = job.get("counts", {}) or {}
+    progress = job.get("progress") or {}
 
-    total = rec["total"]
-    done = rec["counts"].get("processed", 0)
-    status = rec["status"]
+    if status == "failed":
+        st.error(f"Validation failed: {job.get('error') or 'unknown error'}")
+        return
 
-    if status == "complete":
-        st.success(f"Complete · {done}/{total} processed")
-    elif status == "failed":
-        st.error(f"Job failed: {rec.get('error') or 'unknown error'}")
+    is_complete = status == "complete"
+    total = counts.get("total", 0)
+    processed = counts.get("processed", 0)
+
+    if is_complete:
+        st.success(f"Complete · {processed}/{total} processed")
     else:
-        st.info(f"Processing · {done}/{total} — runs on the server and resumes "
-                f"automatically if this tab sleeps or is reopened.")
-    st.progress(done / total if total else 0.0)
+        st.info(f"Status: {status} · {processed}/{total} processed")
+        st.progress(processed / total if total else 0.0)
 
-    cols = st.columns(len(STATUS_LABELS))
-    for col, (k, label) in zip(cols, STATUS_LABELS.items()):
-        col.metric(label, rec["counts"].get(k, 0))
+    for key, label, desc in STAGES:
+        sp = progress.get(key) or {}
+        done, st_total = sp.get("done", 0), sp.get("total", 0)
+        if st_total:
+            pct = done / st_total
+            bar_label = f"{label} — {done}/{st_total}"
+            if key == "stage1":
+                bar_label += f" ({sp.get('passed', 0)} passed, {sp.get('filtered', 0)} filtered)"
+        elif is_complete:
+            # Nothing reached this stage (e.g. no reserved addresses for scoring) —
+            # show an empty bar rather than a misleading full one.
+            pct = 0.0
+            bar_label = f"{label} — none to process"
+        else:
+            pct = 0.0
+            bar_label = f"{label} — 0/0"
+        st.caption(f"{bar_label}  ·  {desc}")
+        st.progress(min(max(pct, 0.0), 1.0))
 
-    promoted = rec["counts"].get("promoted_to_valid", 0)
-    demoted = rec["counts"].get("demoted_to_invalid", 0)
-    if promoted or demoted:
-        st.caption(f"Promotions: {promoted} promoted to valid · {demoted} demoted to invalid")
+    if is_complete:
+        render_results(job_id)
 
-    render_results(rec)
-    return status
 
+# ── Page ───────────────────────────────────────────────────────────────────
+st.title("✉️ EmailVerify")
+st.caption("Validate email lists in minutes. No guessing.")
+
+with st.expander("🔌 SMTP port-25 self-test", expanded=False):
+    test_email = st.text_input(
+        "Probe a real address to confirm port 25 egress",
+        value="postmaster@gmail.com", key="selftest_email",
+    )
+    if st.button("Run port-25 test", disabled=not test_email.strip()):
+        with st.spinner("Connecting on port 25…"):
+            try:
+                out = smtp_selftest(test_email.strip())
+            except Exception as err:  # noqa: BLE001
+                out = {"ok": False, "detail": str(err)}
+        if out.get("ok"):
+            st.success(f"Port 25 reachable ✓  MX={out.get('mx')}  "
+                       f"code={out.get('code')}  sub_status={out.get('sub_status')}")
+        else:
+            st.error("Port 25 NOT reachable / no SMTP banner — "
+                     f"{out.get('detail') or out.get('sub_status')}. "
+                     "Mailbox verification will not work here.")
+
+tab_single, tab_csv = st.tabs(["Single email", "CSV / Excel upload"])
+
+with tab_single:
+    email = st.text_input("Email address", placeholder="someone@example.com")
+    if st.button("Validate email", type="primary", disabled=not email.strip()):
+        jid = start_job([email.strip()], "single")
+        st.session_state["job_id"] = jid
+        st.session_state["input_df"] = None         # single email → rich download
+        st.session_state["input_row_emails"] = None
+        st.toast(f"Job {jid[:8]} started (1 email)")
+
+with tab_csv:
+    st.write("Upload a CSV/XLSX. The result file keeps your original columns and "
+             "adds (or updates) a single `status` column.")
+    upload = st.file_uploader("Choose file", type=["csv", "xlsx", "xls"])
+    if st.button("Validate file", type="primary", disabled=upload is None):
+        in_df, row_emails = parse_upload(upload.name, upload.getvalue())
+        emails = [e for e in row_emails if e]
+        if not emails:
+            st.error("No email-like cells found in that file.")
+        else:
+            jid = start_job(emails, upload.name)
+            st.session_state["job_id"] = jid
+            st.session_state["input_df"] = in_df
+            st.session_state["input_row_emails"] = row_emails
+            st.toast(f"Job {jid[:8]} started ({len(emails)} emails)")
 
 def keep_screen_awake(active: bool) -> None:
     """Hold a Screen Wake Lock on the top page so the display doesn't blank
-    while a job is running (released when active is False). Injected into the
-    parent document because Permissions-Policy allows screen-wake-lock there.
-    Gracefully no-ops on browsers without the API — no side effects."""
+    while a job runs (released when active is False). Keeps the connection alive
+    through a screen-blank when the machine stays on. Graceful no-op where the
+    API is unsupported — no side effects."""
     flag = "true" if active else "false"
     st.components.v1.html(
         """<script>
@@ -418,72 +424,25 @@ def keep_screen_awake(active: bool) -> None:
     )
 
 
-# ── Page ───────────────────────────────────────────────────────────────────
-st.title("✉️ EmailVerify")
-st.caption("Validate email lists in minutes. Jobs are resumable — safe to close and reopen.")
-
-with st.expander("🔌 SMTP port-25 self-test", expanded=False):
-    test_email = st.text_input("Probe a real address to confirm port 25 egress",
-                               value="postmaster@gmail.com", key="selftest_email")
-    if st.button("Run port-25 test", disabled=not test_email.strip()):
-        with st.spinner("Connecting on port 25…"):
-            try:
-                out = smtp_selftest(test_email.strip())
-            except Exception as err:  # noqa: BLE001
-                out = {"ok": False, "detail": str(err)}
-        if out.get("ok"):
-            st.success(f"Port 25 reachable ✓  MX={out.get('mx')}  "
-                       f"code={out.get('code')}  sub_status={out.get('sub_status')}")
-        else:
-            st.error("Port 25 NOT reachable — "
-                     f"{out.get('detail') or out.get('sub_status')}.")
-
-tab_single, tab_csv = st.tabs(["Single email", "CSV / Excel upload"])
-
-with tab_single:
-    email = st.text_input("Email address", placeholder="someone@example.com")
-    if st.button("Validate email", type="primary", disabled=not email.strip()):
-        jid = create_job([email.strip()], "single", None)
-        st.query_params["job"] = jid
-        st.rerun()
-
-with tab_csv:
-    st.write("Upload a CSV/XLSX. The result file keeps your original columns and "
-             "adds (or updates) a single `status` column.")
-    upload = st.file_uploader("Choose file", type=["csv", "xlsx", "xls"])
-    if st.button("Validate file", type="primary", disabled=upload is None):
-        data = upload.getvalue()
-        _, row_emails = parse_upload(upload.name, data)
-        emails = [e for e in row_emails if e]
-        if not emails:
-            st.error("No email-like cells found in that file.")
-        else:
-            jid = create_job(emails, upload.name, data)
-            st.query_params["job"] = jid
-            st.rerun()
-
-# ── Active job (re-attached by URL ?job=...) ───────────────────────────────
-job_id = st.query_params.get("job")
+job_id = st.session_state.get("job_id")
 if job_id:
     st.divider()
-    cols = st.columns([4, 1])
-    cols[0].subheader(f"Job {job_id[:12]}…")
-    if cols[1].button("Clear"):
-        st.query_params.clear()
-        st.rerun()
+    st.subheader(f"Job {job_id}")
+    progress_view(job_id)
 
-    status = render_job(job_id)
+    # Refresh once per second ONLY while the job is still running; stops the
+    # moment results are ready. The job runs in a background thread, so it keeps
+    # going through a screen-blank as long as the tab stays connected.
+    _job = job_store.get(job_id)
+    _running = bool(_job) and _job.get("status") not in ("complete", "failed")
 
-    # Keep the display awake while processing so a screen-blank can't drop the
-    # connection; release it once the job is done.
-    active = status not in ("complete", "failed", None)
-    keep_screen_awake(active)
+    # Keep the display awake while processing so a screen-blank (machine on)
+    # can't drop the connection; released once the job is done.
+    keep_screen_awake(_running)
 
-    # Poll only while running; stops once complete/failed. The worker keeps
-    # going server-side regardless, so reopening the URL resumes the view.
-    if active:
+    if _running:
         st.caption(f"↻ refreshing — {time.strftime('%H:%M:%S')}")
         time.sleep(1)
         st.rerun()
-    elif status is not None:
-        st.caption(f"■ idle — polling stopped (last update {time.strftime('%H:%M:%S')})")
+    else:
+        st.caption(f"■ idle (last update {time.strftime('%H:%M:%S')})")
