@@ -381,6 +381,43 @@ def render_job(job_id: str) -> str | None:
     return status
 
 
+def keep_screen_awake(active: bool) -> None:
+    """Hold a Screen Wake Lock on the top page so the display doesn't blank
+    while a job is running (released when active is False). Injected into the
+    parent document because Permissions-Policy allows screen-wake-lock there.
+    Gracefully no-ops on browsers without the API — no side effects."""
+    flag = "true" if active else "false"
+    st.components.v1.html(
+        """<script>
+        (function(){
+          try{
+            var w = window.parent;
+            w.__evWantWake = %s;
+            if(!w.__evWakeInit){
+              w.__evWakeInit = true; w.__evWakeLock = null;
+              w.__evAcquire = async function(){
+                try{
+                  if(w.__evWantWake && 'wakeLock' in w.navigator && !w.__evWakeLock){
+                    w.__evWakeLock = await w.navigator.wakeLock.request('screen');
+                    w.__evWakeLock.addEventListener('release', function(){ w.__evWakeLock = null; });
+                  }
+                }catch(e){}
+              };
+              w.__evRelease = async function(){
+                try{ if(w.__evWakeLock){ await w.__evWakeLock.release(); w.__evWakeLock = null; } }catch(e){}
+              };
+              w.document.addEventListener('visibilitychange', function(){
+                if(w.document.visibilityState==='visible' && w.__evWantWake){ w.__evAcquire(); }
+              });
+            }
+            if(w.__evWantWake){ w.__evAcquire(); } else { w.__evRelease(); }
+          }catch(e){}
+        })();
+        </script>""" % flag,
+        height=0,
+    )
+
+
 # ── Page ───────────────────────────────────────────────────────────────────
 st.title("✉️ EmailVerify")
 st.caption("Validate email lists in minutes. Jobs are resumable — safe to close and reopen.")
@@ -437,9 +474,14 @@ if job_id:
 
     status = render_job(job_id)
 
+    # Keep the display awake while processing so a screen-blank can't drop the
+    # connection; release it once the job is done.
+    active = status not in ("complete", "failed", None)
+    keep_screen_awake(active)
+
     # Poll only while running; stops once complete/failed. The worker keeps
     # going server-side regardless, so reopening the URL resumes the view.
-    if status not in ("complete", "failed", None):
+    if active:
         st.caption(f"↻ refreshing — {time.strftime('%H:%M:%S')}")
         time.sleep(1)
         st.rerun()
