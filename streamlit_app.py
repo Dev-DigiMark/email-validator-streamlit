@@ -108,15 +108,36 @@ def _row_email(cell) -> str | None:
     return found[0] if found else s
 
 
+def _read_table(name: str, data: bytes, header) -> pd.DataFrame:
+    """Read a CSV/XLSX into all-string columns, tolerant of messy exports.
+
+    Lead-list CSVs often have a stray quote or an extra unquoted comma on a row,
+    which makes pandas' fast C parser abort the whole file. So for CSVs we fall
+    back to the lenient python engine, and finally to skipping only the rows that
+    can't be parsed — never crashing the upload."""
+    if name.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(io.BytesIO(data), header=header, dtype=str)
+    attempts = (
+        {},
+        {"engine": "python"},
+        {"engine": "python", "on_bad_lines": "skip"},
+    )
+    last_err: Exception | None = None
+    for kwargs in attempts:
+        try:
+            return pd.read_csv(io.BytesIO(data), header=header, dtype=str, **kwargs)
+        except (pd.errors.ParserError, ValueError) as err:
+            last_err = err
+            continue
+    raise last_err  # pragma: no cover
+
+
 def parse_upload(name: str, data: bytes):
     """Read the uploaded file preserving its original columns, identify the
     email-bearing column, and return (original_df, row_emails) where row_emails
     holds one email (or None) per row aligned to the dataframe — so we can map
     validation statuses back onto the user's own rows later."""
-    name = name.lower()
-    reader = pd.read_excel if name.endswith((".xlsx", ".xls")) else pd.read_csv
-
-    df = reader(io.BytesIO(data), dtype=str)
+    df = _read_table(name, data, header=0)
 
     def col_score(col) -> int:
         return sum(1 for v in df[col].tolist() if _first_email(v))
@@ -130,7 +151,7 @@ def parse_upload(name: str, data: bytes):
     # Headerless heuristic: if the detected column's *name* is itself an email,
     # the file had no header row (pandas ate the first email) — re-read raw.
     if isinstance(email_col, str) and EMAIL_RE.findall(email_col):
-        df = reader(io.BytesIO(data), header=None, dtype=str)
+        df = _read_table(name, data, header=None)
         email_col = max(df.columns, key=col_score)
 
     row_emails = [_row_email(v) for v in df[email_col].tolist()]
