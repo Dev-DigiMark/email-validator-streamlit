@@ -111,6 +111,14 @@ async def get_job(job_id: str):
     return {"status": job["status"], "counts": job["counts"], "progress": job["progress"]}
 
 
+@app.get("/logs/{job_id}")
+async def get_logs(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "Job not found", "code": "NOT_FOUND"})
+    return {"jobId": job_id, "logs": job.get("logs", [])}
+
+
 @app.get("/results/{job_id}")
 async def get_results(job_id: str):
     job = job_store.get(job_id)

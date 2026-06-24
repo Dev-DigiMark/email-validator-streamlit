@@ -26,6 +26,7 @@ class JobStore:
             "filename": filename,
             "status": "pending",
             "results": [],
+            "logs": [],
             "counts": {
                 "total": email_count,
                 "processed": 0,
@@ -43,7 +44,20 @@ class JobStore:
             "progress": None,
         }
         self._jobs[id] = state
+        self.log(id, f"task created — {email_count} emails (file: {filename})")
         return state
+
+    def log(self, id: str, message: str, stdout: bool = True) -> None:
+        """Append a timestamped event to this task's log. Per-task logs are kept
+        on the job record (shown/downloadable in the UI); important events also
+        go to stdout, tagged with the task id, so they appear in the Streamlit
+        Cloud / server logs for deeper investigation."""
+        job = self._jobs.get(id)
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        if job is not None:
+            job.setdefault("logs", []).append(line)
+        if stdout:
+            print(f"[task {id[:8]}] {line}", flush=True)
 
     def get(self, id: str) -> Optional[dict[str, Any]]:
         return self._jobs.get(id)
@@ -52,6 +66,9 @@ class JobStore:
         job = self._jobs.get(id)
         if not job:
             return
+        new_status = updates.get("status")
+        if new_status and new_status != job.get("status"):
+            self.log(id, f"status → {new_status}")
         job.update(updates)
 
     def increment_count(self, id: str, field: str, amount: int = 1) -> None:
@@ -74,6 +91,10 @@ class JobStore:
         if not job:
             return
         job["results"].append(result)
+        # Per-email outcome — kept in the task log (not stdout) so the full
+        # detail is available in the UI without flooding the server logs.
+        code = f" [{result.smtp_response_code}]" if result.smtp_response_code is not None else ""
+        self.log(id, f"{result.email} → {result.status}/{result.sub_status}{code}", stdout=False)
 
     def get_filtered_results(
         self,

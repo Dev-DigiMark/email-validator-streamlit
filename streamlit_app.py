@@ -69,8 +69,13 @@ st.set_page_config(page_title="EmailVerify", page_icon="✉️", layout="wide")
 def _run_in_thread(emails: list[str], job_id: str) -> None:
     """Run the async pipeline in its own event loop on a daemon thread so the
     Streamlit script/fragment never blocks. The job_store singleton is shared
-    module state, so the UI thread sees progress as it's written."""
-    asyncio.run(run_pipeline(emails, job_id))
+    module state, so the UI thread sees progress as it's written. Any crash is
+    logged to the task and surfaced as a failed status instead of dying silently."""
+    try:
+        asyncio.run(run_pipeline(emails, job_id))
+    except Exception as err:  # noqa: BLE001
+        job_store.log(job_id, f"ERROR: {err}")
+        job_store.update(job_id, status="failed", error=str(err))
 
 
 def start_job(emails: list[str], filename: str) -> str:
@@ -445,11 +450,31 @@ def keep_screen_awake(active: bool) -> None:
     )
 
 
+def render_task_log(job_id: str) -> None:
+    job = job_store.get(job_id)
+    logs = (job or {}).get("logs", [])
+    with st.expander(f"📋 Task log ({len(logs)} events)"):
+        st.code("\n".join(logs[-200:]) or "(no events yet)", language="log")
+        if logs:
+            st.download_button(
+                "⬇ Download full log",
+                data="\n".join(logs).encode("utf-8"),
+                file_name=f"task_{job_id[:8]}.log",
+                mime="text/plain",
+                key=f"dllog_{job_id}",
+            )
+
+
 job_id = st.session_state.get("job_id")
 if job_id:
     st.divider()
-    st.subheader(f"Job {job_id}")
+    # Prominent, copyable Task ID — share this when reporting an issue.
+    st.subheader("Task")
+    st.code(job_id, language=None)
+    st.caption("Task ID — copy this when reporting an issue so it can be traced in the logs.")
+
     progress_view(job_id)
+    render_task_log(job_id)
 
     # Refresh once per second ONLY while the job is still running; stops the
     # moment results are ready. The job runs in a background thread, so it keeps
